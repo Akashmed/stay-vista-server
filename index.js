@@ -1,271 +1,315 @@
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-require("dotenv").config();
-const express = require("express");
-const app = express();
-const port = process.env.PORT || 5000;
-const jwt = require("jsonwebtoken");
-const cors = require("cors");
-const morgan = require("morgan");
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-const nodemailer = require("nodemailer");
-app.use(cors());
-app.use(express.json());
-app.use(morgan("dev"));
+const express = require('express')
+const app = express()
+require('dotenv').config()
+const cors = require('cors')
+const cookieParser = require('cookie-parser')
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
+const jwt = require('jsonwebtoken')
+const morgan = require('morgan')
+const port = process.env.PORT || 5000
+const stripe = require('stripe')(process.env.SECRET_PAYMENT_KEY)
 
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.2cofc5d.mongodb.net/?retryWrites=true&w=majority`;
+// middleware
+const corsOptions = {
+  origin: ['http://localhost:5173', 'http://localhost:5174'],
+  credentials: true,
+  optionSuccessStatus: 200,
+}
+app.use(cors(corsOptions))
+app.use(express.json())
+app.use(cookieParser())
+app.use(morgan('dev'))
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+
+const verifyToken = async (req, res, next) => {
+  const token = req.cookies?.token
+  console.log(token)
+  if (!token) {
+    return res.status(401).send({ message: 'unauthorized access' })
+  }
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      console.log(err)
+      return res.status(401).send({ message: 'unauthorized access' })
+    }
+    req.user = decoded
+    next()
+  })
+}
+
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.wwbu2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
   },
-});
-
-const verifyJwt = (req, res, next) => {
-  const authorization = req.headers.authorization;
-  console.log(authorization);
-
-  if (!authorization) {
-    return res.status(401).send({ message: "Unauthorized Access" });
-  }
-  const token = authorization.split(" ")[1];
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
-    if (err) {
-      return res
-        .status(401)
-        .send({ error: true, message: "Unauthorized Access" });
-    }
-    req.decoded = decoded;
-  });
-  next();
-};
-
-// email sender
-const sendMail = (emailData, emailAddress) => {
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.EMAIL,
-      pass: process.env.PASS,
-    },
-  });
-  const mailOptions = {
-    from: process.env.EMAIL,
-    to: emailAddress,
-    subject: emailData.subject,
-    html: `<p>${emailData?.message}</p>`,
-  };
-
-  transporter.sendMail(mailOptions, (err, info) => {
-    if (err) {
-      console.log(err);
-    } else {
-      console.log("Email sent: " + info.response);
-    }
-  });
-};
-
+})
 async function run() {
   try {
-    const roomsCollection = client.db("airCncDb").collection("rooms");
-    const usersCollection = client.db("airCncDb").collection("users");
-    const bookingsCollection = client.db("airCncDb").collection("bookings");
+    await client.connect();
+    const usersCollection = client.db('vistaDB').collection('users');
+    const roomsCollection = client.db('vistaDB').collection('rooms');
+    const bookingsCollection = client.db('vistaDB').collection('bookings');
 
-    // generate client secret
-
-    // verify host
-    const verifyHost = async (req, res, next) => {
-      const decodedEmail = req.decoded.email;
-      console.log(decodedEmail);
-      const query = { email: decodedEmail };
-      const user = await usersCollection.findOne(query);
-      if (user?.role !== "host") {
-        return res
-          .status(403)
-          .send({ error: true, message: "Forbidden access" });
-      }
+    // role verification middleware
+    // for admin
+    const verifyAdmin = async(req, res, next) =>{
+      const user = req.user;
+      const query = {email: user?.email};
+      const result = await usersCollection.findOne(query);
+      if(!result || result?.role !== 'admin') return res.status(401).send({message: 'unauthorized access'})
       next();
-    };
+    }
 
-    // Connect the client to the server	(optional starting in v4.7)
-    // await client.connect();
+    // for host
+    const verifyHost = async(req, res, next) =>{
+      const user = req.user;
+      const query = {email: user?.email};
+      const result = await usersCollection.findOne(query);
+      if(!result || result?.role !== 'host') return res.status(401).send({message: 'unauthorized access'})
+      next();
+    }
 
-    // create payment intent
-    app.post("/create-payment-intent", verifyJwt, async (req, res) => {
-      const { price } = req.body;
-      const amount = parseFloat(price) * 100;
-      if (!price) return;
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: amount,
-        currency: "usd",
-        payment_method_types: ["card"],
-      });
+    // auth related api
+    app.post('/jwt', async (req, res) => {
+      const user = req.body
+      console.log('I need a new jwt', user)
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: '365d',
+      })
+      res
+        .cookie('token', token, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict',
+        })
+        .send({ success: true })
+    })
 
-      res.send({
-        clientSecret: paymentIntent.client_secret,
-      });
-    });
-    // jwt process
+    // Logout
+    app.get('/logout', async (req, res) => {
+      try {
+        res
+          .clearCookie('token', {
+            maxAge: 0,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict',
+          })
+          .send({ success: true })
+        console.log('Logout successful')
+      } catch (err) {
+        res.status(500).send(err)
+      }
+    })
 
-    app.post("/jwt", (req, res) => {
-      const email = req.body;
-      const token = jwt.sign(email, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: "1h",
-      });
-      res.send({ token });
-    });
-    // save user email and role in db
-    app.put("/users/:email", async (req, res) => {
-      const email = req.params.email;
-      const user = req.body;
-      const query = { email: email };
-      const options = { upsert: true };
-      const updateDoc = {
-        $set: user,
-      };
-      const result = await usersCollection.updateOne(query, updateDoc, options);
+    // Save or modify a new user's email, status in DB
+    app.put('/users/:email', async (req, res) => {
+      const email = req.params.email
+      const user = req.body
+      const query = { email: email }
+      const options = { upsert: true }
+      const isExist = await usersCollection.findOne(query)
+      console.log('User found?----->', isExist)
+      if (isExist){
+        if(user.status === 'requested'){
+          const result = await usersCollection.updateOne(
+            query,
+            {
+               $set: user
+            },
+            options
+          )
+          return res.send(result);
+        }else{
+          return res.send(isExist)
+        }
+      }
+      const result = await usersCollection.updateOne(
+        query,
+        {
+          $set: { ...user, timestamp: Date.now() },
+        },
+        options
+      )
       res.send(result);
     });
-    // get all rooms from db
-    app.get("/rooms", async (req, res) => {
+
+    app.get('/user/:email', async (req, res) => {
+      const email = req.params.email;
+      const result = await usersCollection.findOne({ email });
+      res.send(result);
+    })
+
+    // get all rooms 
+    app.get('/rooms', async (req, res) => {
       const result = await roomsCollection.find().toArray();
       res.send(result);
     });
 
-    // get single room details
-    app.get("/rooms/:id", async (req, res) => {
-      const id = req.params.id;
-
-      const result = await roomsCollection.findOne({ _id: new ObjectId(id) });
-      res.send(result);
-    });
-    // post room data to the server
-    app.post("/rooms", verifyJwt, verifyHost, async (req, res) => {
-      const roomInfo = req.body;
-      const result = await roomsCollection.insertOne(roomInfo);
-      res.send(result);
-    });
-
-    app.put("/rooms/:id", verifyJwt, async (req, res) => {
-      const room = req.body;
-      console.log(room);
-
-      const filter = { _id: new ObjectId(req.params.id) };
-      const options = { upsert: true };
-      const updateDoc = {
-        $set: room,
-      };
-      const result = await roomsCollection.updateOne(
-        filter,
-        updateDoc,
-        options
-      );
-      res.send(result);
-    });
-    // get host added rooms
-    app.get("/rooms/host/:email", verifyJwt, async (req, res) => {
-      const decodedEmail = req.decoded.email;
+    // get rooms for specific host
+    app.get('/rooms/:email', async (req, res) => {
       const email = req.params.email;
-      if (email !== decodedEmail) {
-        return res
-          .status(403)
-          .send({ error: true, message: "Forbidden Access" });
-      }
-      const result = await roomsCollection
-        .find({ "host.email": email })
-        .toArray();
-
+      const query = { 'host.email': email }; //this is the way(quotation) when the field is in a object in db
+      const result = await roomsCollection.find(query).toArray();
       res.send(result);
     });
-    // delete room api
-    app.delete("/rooms/:id", async (req, res) => {
+
+    // get single room
+    app.get('/room/:id', async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
-
-      const result = await roomsCollection.deleteOne(query);
+      const result = await roomsCollection.findOne(query);
       res.send(result);
     });
 
-    // post bookings details in the db
-    app.post("/bookings", async (req, res) => {
-      const bookingInfo = req.body;
-      // Send confirmation email to guest
-      const result = await bookingsCollection.insertOne(bookingInfo);
-      sendMail(
-        {
-          subject: "Booking Successful!",
-          message: `Booking Id: ${result?.insertedId}, TransactionId: ${bookingInfo.transactionId}`,
-        },
-        bookingInfo?.guest?.email
-      );
-      // Send confirmation email to host
-      sendMail(
-        {
-          subject: "Your room got booked!",
-          message: `Booking Id: ${result?.insertedId}, TransactionId: ${bookingInfo.transactionId}. Check dashboard for more info`,
-        },
-        bookingInfo?.host
-      );
-
+    // add room to database
+    app.post('/rooms', verifyToken, async (req, res) => {
+      const roomData = req.body;
+      const result = await roomsCollection.insertOne(roomData);
       res.send(result);
-    });
+    })
 
-    // get bookings details from db
-    app.get("/bookings/:email", async (req, res) => {
-      const email = req.params.email;
-      if (!email) {
-        res.send([]);
-      }
-      const query = { "guest.email": email };
-      const result = await bookingsCollection.find(query).toArray();
-      res.send(result);
-    });
+    // stripe client secret key
+    app.post('/create-payment-intent', verifyToken, async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      if (!price || amount < 1) return;
+      const { client_secret } = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      });
+      res.send({ clientSecret: client_secret });
+    })
 
-    // delete a booking
-    app.delete("/bookings/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const result = await bookingsCollection.deleteOne(query);
+    // save booking info to db
+    app.post('/bookings', verifyToken, async (req, res) => {
+      const booking = req.body;
+      const result = await bookingsCollection.insertOne(booking);
+      // send email
       res.send(result);
-    });
+    })
 
     // update room booking status
-    app.patch("/rooms/status/:id", async (req, res) => {
+    app.patch('/rooms/status/:id', async (req, res) => {
       const id = req.params.id;
       const status = req.body.status;
       const query = { _id: new ObjectId(id) };
       const updateDoc = {
         $set: {
-          booked: status,
-        },
+          booked: status
+        }
       };
-      const update = await roomsCollection.updateOne(query, updateDoc);
-      res.send(update);
-    });
-
-    // get user information
-    app.get("/users/:email", async (req, res) => {
-      const email = req.params.email;
-      const result = await usersCollection.findOne({ email: email });
+      const result = await roomsCollection.updateOne(query, updateDoc);
       res.send(result);
-    });
+    })
+
+    // get all booking for guest
+    app.get('/bookings', verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.send([]);
+      const query = { 'guest.email': email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    })
+
+    // get all bookings for host
+    app.get('/bookings/host', verifyToken, verifyHost, async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.send([]);
+      const query = { host: email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    })
+
+    // get all users
+    app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+      const result = await usersCollection.find().toArray();
+      res.send(result);
+    })
+
+    // update user role
+    app.put('/users/update/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+      const user = req.body;
+      const query = { email: email };
+      const options = { upsert: true };
+      const updateDoc = {
+        $set: {
+          ...user,
+          timestamp: Date.now()
+        }
+      };
+      const result = await usersCollection.updateOne(query, updateDoc, options);
+      res.send(result);
+    })
+
+    // Admin Statistics
+    app.get('/admin-stat', verifyToken, verifyAdmin, async (req, res) => {
+      const bookingDetails = await bookingsCollection
+        .find(
+          {},
+          {
+            projection: {
+              date: 1,
+              price: 1,
+            },
+          }
+        )
+        .toArray()
+
+      const totalUsers = await usersCollection.countDocuments()
+      const totalRooms = await roomsCollection.countDocuments()
+      const totalPrice = bookingDetails.reduce(
+        (sum, booking) => sum + booking.price,
+        0
+      )
+      // const data = [
+      //   ['Day', 'Sales'],
+      //   ['9/5', 1000],
+      //   ['10/2', 1170],
+      //   ['11/1', 660],
+      //   ['12/11', 1030],
+      // ]
+      const chartData = bookingDetails.map(booking => {
+        const day = new Date(booking.date).getDate()
+        const month = new Date(booking.date).getMonth() + 1
+        const data = [`${day}/${month}`, booking?.price]
+        return data
+      })
+      chartData.unshift(['Day', 'Sales'])
+      // chartData.splice(0, 0, ['Day', 'Sales'])
+
+      console.log(chartData)
+
+      console.log(bookingDetails)
+      res.send({
+        totalUsers,
+        totalRooms,
+        totalBookings: bookingDetails.length,
+        totalPrice,
+        chartData,
+      })
+    })
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Database connected");
+    await client.db('admin').command({ ping: 1 })
+    console.log(
+      'Pinged your deployment. You successfully connected to MongoDB!'
+    )
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
   }
 }
-run().catch(console.dir);
+run().catch(console.dir)
 
-app.get("/", (req, res) => {
-  res.send("Server is busy");
-});
+app.get('/', (req, res) => {
+  res.send('Hello from StayVista Server..')
+})
 
 app.listen(port, () => {
-  console.log("Server running at port", port);
-});
+  console.log(`StayVista is running on port ${port}`)
+})
