@@ -11,7 +11,7 @@ const stripe = require('stripe')(process.env.SECRET_PAYMENT_KEY)
 
 // middleware
 const corsOptions = {
-  origin: ['http://localhost:5173', 'http://localhost:5174'],
+  origin: [process.env.URL, 'http://localhost:5174'],
   credentials: true,
   optionSuccessStatus: 200,
 }
